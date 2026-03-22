@@ -81,3 +81,32 @@ python plot_paper_figures.py --run-dir runs/bird_train/yolo11_bird_hier --out-di
 - `paper_precision_curve.png`
 - `paper_recall_curve.png`
 
+
+## 6) AutoDL 一键脚本（推荐）
+
+已提供 `run_autodl_train.sh`，可在 AutoDL 直接一键跑通“数据准备+训练”，并带有 OOM 自动降档重试。
+
+```bash
+bash run_autodl_train.sh
+```
+
+常用环境变量（可选覆盖默认值）：
+
+```bash
+MODEL_DIR=model
+OUT_DIR=model/processed
+RUN_PROJECT=runs/bird_train
+RUN_NAME=yolo11_bird_hier
+MODEL_WEIGHTS=yolo11l.pt
+EPOCHS=100
+STEPS_PER_EPOCH=200
+BATCH=30
+IMGSZ=960
+PREPARE_DATA=1
+bash run_autodl_train.sh
+```
+
+说明：
+- 若不设置 `BATCH/IMGSZ`，脚本会根据 `nvidia-smi` 检测显存自动选择。
+- `BATCH` 必须可被 3 整除（保证 CUB:web = 1:2）。
+- 若训练失败（常见为显存不足），脚本会自动降 `BATCH/IMGSZ` 并重试。
