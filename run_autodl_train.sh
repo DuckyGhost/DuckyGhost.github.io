@@ -21,6 +21,7 @@ STEPS_PER_EPOCH="${STEPS_PER_EPOCH:-200}"
 WORKERS="${WORKERS:-8}"
 VAL_RATIO="${VAL_RATIO:-0.1}"
 WEB_CONF="${WEB_CONF:-0.25}"
+WEB_FALLBACK_FULLBOX="${WEB_FALLBACK_FULLBOX:-1}"  # 1 enable full-image box when detector misses
 SEED="${SEED:-42}"
 PREPARE_DATA="${PREPARE_DATA:-1}"  # 1: run prepare, 0: skip
 
@@ -32,12 +33,26 @@ check_cmd() {
 
 check_cmd python
 
-if [[ ! -f "$MODEL_DIR/CUB-200-2011.tar" ]]; then
-  echo "Missing: $MODEL_DIR/CUB-200-2011.tar"
+find_first_existing() {
+  local base="$1"; shift
+  for n in "$@"; do
+    if [[ -f "$base/$n" ]]; then
+      echo "$base/$n"
+      return 0
+    fi
+  done
+  return 1
+}
+
+CUB_ARCHIVE="$(find_first_existing "$MODEL_DIR" "CUB-200-2011.tar" "CUB_200_2011.tgz" "CUB_200_2011.tar.gz" || true)"
+WEB_ARCHIVE="$(find_first_existing "$MODEL_DIR" "web-bird.tar.gz" "web_bird.tar.gz" "webbird.tar.gz" || true)"
+
+if [[ -z "${CUB_ARCHIVE}" ]]; then
+  echo "Missing CUB archive in $MODEL_DIR (supported: CUB-200-2011.tar / CUB_200_2011.tgz / CUB_200_2011.tar.gz)"
   exit 1
 fi
-if [[ ! -f "$MODEL_DIR/web-bird.tar.gz" ]]; then
-  echo "Missing: $MODEL_DIR/web-bird.tar.gz"
+if [[ -z "${WEB_ARCHIVE}" ]]; then
+  echo "Missing web-bird archive in $MODEL_DIR (supported: web-bird.tar.gz / web_bird.tar.gz / webbird.tar.gz)"
   exit 1
 fi
 
@@ -78,6 +93,7 @@ fi
 
 log "GPU total memory (MB): ${GPU_MEM_MB}"
 log "Using BATCH=${BATCH}, IMGSZ=${IMGSZ}, EPOCHS=${EPOCHS}, STEPS_PER_EPOCH=${STEPS_PER_EPOCH}"
+log "Using archives: CUB=$(basename "$CUB_ARCHIVE"), WEB=$(basename "$WEB_ARCHIVE")"
 
 if [[ "$PREPARE_DATA" == "1" ]]; then
   log "[1/3] Preparing dataset"
@@ -86,7 +102,8 @@ if [[ "$PREPARE_DATA" == "1" ]]; then
     --out-dir "$OUT_DIR" \
     --val-ratio "$VAL_RATIO" \
     --seed "$SEED" \
-    --web-conf "$WEB_CONF"
+    --web-conf "$WEB_CONF" \
+    $([[ "$WEB_FALLBACK_FULLBOX" == "1" ]] && echo "--web-fallback-fullbox")
 else
   log "[1/3] Skip data preparation (PREPARE_DATA=0)"
 fi

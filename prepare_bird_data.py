@@ -26,6 +26,59 @@ def safe_extract_tar(archive_path: Path, dst: Path) -> None:
         tar.extractall(dst)
 
 
+def resolve_first_existing(base: Path, candidates: List[str]) -> Path:
+    for name in candidates:
+        p = base / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(f"None of candidates exist under {base}: {candidates}")
+
+
+def find_cub_root(extract_root: Path) -> Path:
+    """Find CUB root folder containing required metadata txt files."""
+    required = {"images.txt", "bounding_boxes.txt", "classes.txt", "image_class_labels.txt"}
+    common_candidates = [
+        extract_root / "CUB-200-2011",
+        extract_root / "CUB_200_2011",
+        extract_root / "CUB_200_2011" / "CUB_200_2011",
+    ]
+    for c in common_candidates:
+        if c.exists() and required.issubset({p.name for p in c.glob("*.txt")}):
+            return c
+
+    # Fallback: search a few levels deep
+    for p in extract_root.glob("**/*"):
+        if not p.is_dir():
+            continue
+        txt_names = {x.name for x in p.glob("*.txt")}
+        if required.issubset(txt_names):
+            return p
+    raise FileNotFoundError(
+        f"Unable to locate CUB root under {extract_root}. "
+        f"Expected files: {sorted(required)}"
+    )
+
+
+def find_webbird_root(extract_root: Path) -> Path:
+    """Find web-bird ImageFolder root (each child dir is a class)."""
+    common = [extract_root / "web-bird", extract_root / "web_bird", extract_root / "webbird"]
+    for c in common:
+        if c.exists() and any(x.is_dir() for x in c.iterdir()):
+            return c
+
+    # Fallback: choose the directory with most subdirectories (class folders)
+    best = None
+    best_cnt = -1
+    for p in extract_root.glob("**/*"):
+        if p.is_dir():
+            cnt = sum(1 for x in p.iterdir() if x.is_dir())
+            if cnt > best_cnt:
+                best, best_cnt = p, cnt
+    if best is None:
+        raise FileNotFoundError(f"Unable to locate web-bird root under {extract_root}")
+    return best
+
+
 def normalize_name(name: str) -> str:
     return name.lower().replace("_", " ").replace("-", " ")
 
@@ -151,10 +204,30 @@ def parse_cub(cub_root: Path, out_root: Path, val_ratio: float, seed: int) -> Tu
     return coarse2id, fine2coarse
 
 
-def load_webbird_classes(web_root: Path) -> List[str]:
-    classes = [p.name for p in web_root.iterdir() if p.is_dir()]
-    classes.sort()
-    return classes
+def collect_webbird_images(web_root: Path) -> List[Tuple[str, Path]]:
+    """Collect (class_name, image_path) from ImageFolder-like layouts.
+
+    Supports:
+    - web_root/<class>/*.jpg
+    - web_root/<split>/<class>/*.jpg
+    - deeper nested folders (uses parent dir name as class)
+    """
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    # 1) Try one-level ImageFolder first
+    pairs: List[Tuple[str, Path]] = []
+    for class_dir in [p for p in web_root.iterdir() if p.is_dir()]:
+        imgs = [p for p in class_dir.glob("*.*") if p.suffix.lower() in exts]
+        for p in imgs:
+            pairs.append((class_dir.name, p))
+    if pairs:
+        return pairs
+
+    # 2) Fallback recursive search (split/class/image etc.)
+    for p in web_root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts:
+            pairs.append((p.parent.name, p))
+    return pairs
 
 
 def generate_webbird_pseudoboxes(
@@ -164,16 +237,18 @@ def generate_webbird_pseudoboxes(
     val_ratio: float,
     seed: int,
     conf_thres: float,
+    fallback_fullbox: bool,
 ) -> None:
     from ultralytics import YOLO
 
     model = YOLO("yolo11x.pt")
 
-    all_images: List[Tuple[str, Path]] = []
-    for cls in load_webbird_classes(web_root):
-        for p in (web_root / cls).glob("*.*"):
-            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
-                all_images.append((cls, p))
+    all_images = collect_webbird_images(web_root)
+    if not all_images:
+        raise RuntimeError(
+            f"No images found in web-bird root: {web_root}. "
+            "Please check extracted folder structure."
+        )
 
     rnd = random.Random(seed)
     rnd.shuffle(all_images)
@@ -186,12 +261,25 @@ def generate_webbird_pseudoboxes(
 
     kept = 0
     dropped = 0
+    broken_or_unreadable = 0
 
     for cls, img_path in all_images:
         split = "val" if str(img_path) in val_names else "train"
 
-        pred = model.predict(source=str(img_path), conf=conf_thres, verbose=False)
-        boxes = pred[0].boxes
+        try:
+            # Pre-check readability to avoid downstream OpenCV/Numpy stack errors
+            with Image.open(img_path) as im:
+                im.verify()
+        except Exception:
+            broken_or_unreadable += 1
+            continue
+
+        try:
+            pred = model.predict(source=str(img_path), conf=conf_thres, verbose=False)
+            boxes = pred[0].boxes
+        except Exception:
+            broken_or_unreadable += 1
+            continue
         bird_boxes = []
         for b in boxes:
             c = int(b.cls.item())
@@ -200,8 +288,11 @@ def generate_webbird_pseudoboxes(
                 bird_boxes.append(b)
 
         if not bird_boxes:
-            dropped += 1
-            continue
+            if fallback_fullbox:
+                bird_boxes = [None]  # sentinel: full-image box
+            else:
+                dropped += 1
+                continue
 
         with Image.open(img_path) as im:
             w_img, h_img = im.size
@@ -218,7 +309,10 @@ def generate_webbird_pseudoboxes(
         lbl = out_root / "labels" / split / f"{Path(dst_name).stem}.txt"
         with lbl.open("w", encoding="utf-8") as f:
             for b in bird_boxes:
-                x1, y1, x2, y2 = b.xyxy[0].tolist()
+                if b is None:
+                    x1, y1, x2, y2 = 0.0, 0.0, float(w_img), float(h_img)
+                else:
+                    x1, y1, x2, y2 = b.xyxy[0].tolist()
                 bw = x2 - x1
                 bh = y2 - y1
                 x_c = (x1 + x2) / 2.0 / w_img
@@ -228,7 +322,13 @@ def generate_webbird_pseudoboxes(
                 f.write(f"{coarse_id} {x_c:.6f} {y_c:.6f} {w_n:.6f} {h_n:.6f}\n")
         kept += 1
 
-    stats = {"webbird_kept": kept, "webbird_dropped_no_bird_box": dropped}
+    stats = {
+        "webbird_total_found_images": len(all_images),
+        "webbird_kept": kept,
+        "webbird_dropped_no_bird_box": dropped,
+        "webbird_broken_or_unreadable": broken_or_unreadable,
+        "fallback_fullbox_enabled": fallback_fullbox,
+    }
     with (out_root / "webbird_pseudobox_stats.json").open("w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
 
@@ -258,27 +358,45 @@ def main() -> None:
     ap.add_argument("--val-ratio", default=0.1, type=float)
     ap.add_argument("--seed", default=42, type=int)
     ap.add_argument("--web-conf", default=0.25, type=float)
+    ap.add_argument(
+        "--web-fallback-fullbox",
+        action="store_true",
+        help="If no bird is detected on a web image, use whole image as fallback bbox.",
+    )
     args = ap.parse_args()
 
     model_dir = Path(args.model_dir)
     out_dir = Path(args.out_dir)
 
-    cub_tar = model_dir / "CUB-200-2011.tar"
-    web_tar = model_dir / "web-bird.tar.gz"
+    cub_tar = resolve_first_existing(model_dir, ["CUB-200-2011.tar", "CUB_200_2011.tgz", "CUB_200_2011.tar.gz"])
+    web_tar = resolve_first_existing(model_dir, ["web-bird.tar.gz", "web_bird.tar.gz", "webbird.tar.gz"])
 
     extract_root = model_dir / "_extracted"
-    cub_ext = extract_root / "CUB-200-2011"
-    web_ext = extract_root / "web-bird"
+    extract_root.mkdir(parents=True, exist_ok=True)
 
-    if not cub_ext.exists():
+    if not any((extract_root / n).exists() for n in ["CUB-200-2011", "CUB_200_2011"]):
         safe_extract_tar(cub_tar, extract_root)
-    if not web_ext.exists():
+    if not any((extract_root / n).exists() for n in ["web-bird", "web_bird", "webbird"]):
         safe_extract_tar(web_tar, extract_root)
+
+    cub_ext = find_cub_root(extract_root)
+    web_ext = find_webbird_root(extract_root)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Resolved CUB root: {cub_ext}")
+    print(f"Resolved web-bird root: {web_ext}")
+
     coarse2id, fine2coarse = parse_cub(cub_ext, out_dir, args.val_ratio, args.seed)
-    generate_webbird_pseudoboxes(web_ext, out_dir, coarse2id, args.val_ratio, args.seed, args.web_conf)
+    generate_webbird_pseudoboxes(
+        web_ext,
+        out_dir,
+        coarse2id,
+        args.val_ratio,
+        args.seed,
+        args.web_conf,
+        args.web_fallback_fullbox,
+    )
     write_dataset_yaml(out_dir, coarse2id)
 
     hierarchy = {

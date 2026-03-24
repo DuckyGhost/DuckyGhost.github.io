@@ -47,7 +47,11 @@ def collect_train_pairs(dataset_root: Path) -> Tuple[List[Tuple[Path, Path]], Li
     if not cub_pairs:
         raise RuntimeError("No CUB samples found in processed train split.")
     if not web_pairs:
-        raise RuntimeError("No web-bird samples found in processed train split.")
+        raise RuntimeError(
+            "No web-bird samples found in processed train split. "
+            "Check model/processed/webbird_pseudobox_stats.json and rerun "
+            "prepare_bird_data.py with lower --web-conf or --web-fallback-fullbox."
+        )
 
     return cub_pairs, web_pairs, web_cls_map
 
